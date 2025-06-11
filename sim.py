@@ -113,8 +113,7 @@ def run_simulation(
         StateDataReporter(stdout, steps_per_block, step=True,
                           potentialEnergy=True, temperature=True),
         DCDReporter(f"{out_prefix}.dcd", steps_per_block),
-        HDF5Reporter(f"{out_prefix}.h5", steps_per_block,
-                     positions=True, time=True)
+        HDF5Reporter(f"{out_prefix}.h5", steps_per_block)
     ]
 
     spins = charges.astype(int).copy()
@@ -161,7 +160,7 @@ def run_simulation_with_spin_sequence(
 
     sim.reporters += [
         DCDReporter(f"{out_prefix}.dcd", steps_per_frame),
-        HDF5Reporter(f"{out_prefix}.h5", steps_per_frame, positions=True)
+        HDF5Reporter(f"{out_prefix}.h5", steps_per_frame)
     ]
 
     end2end = []
