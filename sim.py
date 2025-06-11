@@ -1,278 +1,187 @@
 #!/usr/bin/env python3
-"""sim.py
-===========
-Reusable OpenMM driver for a coarse‑grained 1‑D polymer with optional
-Coulomb interaction defined by an external vector of charges *and* an
-optional on‑the‑fly Ising update.
+"""
+sim.py  –  OpenMM driver for coarse-grained 1-D polymer
+=======================================================
 
-Typical notebook usage
-----------------------
-```python
-import numpy as np
-from sim import run_simulation
-
-# prepare charges (here: ±1 spins from some Ising model you calculated earlier)
-charges = np.random.choice([-1, 1], size=100)
-
-# run MD with *fixed* charges
-data = run_simulation(charges,
-                      kc=1.0,          # prefactor in kJ·nm/mol
-                      n_blocks=500,
-                      steps_per_block=2000,
-                      dynamic=False,   # ← no Ising updates inside MD
-                      out_prefix='ising_fixed')
-
-# run MD where the same vector acts as *initial* spins that keep evolving
-run_simulation(charges,
-               kc=1.0,
-               n_blocks=500,
-               steps_per_block=2000,
-               dynamic=True,    # ← enable Metropolis sweeps
-               out_prefix='ising_dynamic')
-```
-The routine returns a dictionary with the measured end‑to‑end distance array
-and names of the generated trajectory/data files so you can post‑process them
-from the notebook.
+* Umożliwia MD z: (1) wiązaniami harm., (2) sztywnością kątową,
+  (3) excluded-volume z pliku XML, (4) dowolnym wektorem ładunków
+  w potencjale U = kc · q1 · q2 / r.
+* Tryb `dynamic=True` → po każdym bloku MD wykonywany jest pełny sweep
+  Metropolisa (1-D Ising, J=1, kBT=1) i ładunki aktualizują się w locie.
+* Funkcja `run_simulation_with_spin_sequence` pozwala zamiast tego
+  podać **gotową trajektorię spinów** (np. przygotowaną w innym kodzie).
 """
 
 from __future__ import annotations
-
-# ────────── standard library ──────────
+# ────────── stdlib ──────────
 import os
 from sys import stdout
-
-# ────────── third‑party ──────────
+# ────────── third-party ──────────
 import numpy as np
 from tqdm import tqdm
-
 import openmm as mm
 import openmm.unit as u
 from openmm.app import (
-    PDBxFile,
-    ForceField,
-    Simulation,
-    DCDReporter,
-    StateDataReporter,
+    PDBxFile, ForceField, Simulation,
+    DCDReporter, StateDataReporter
 )
 from mdtraj.reporters import HDF5Reporter
+# ────────── local helpers (z wcześniejszych zadań) ──────────
+from utils import line, write_mmcif, generate_psf   # type: ignore
 
-# ────────── local helper routines (provided in earlier tasks) ──────────
-from utils import line, write_mmcif, generate_psf  # type: ignore
-
-# ──────────── constants ────────────
-N_BEADS = 100                # chain length (keep in sync with utils helpers!)
+# ───────────── stałe ─────────────
+N_BEADS      = 100
 DEFAULT_TEMP = 310 * u.kelvin
-TIME_STEP = 100 * u.femtosecond
-INIT_CIF = "init_struct.cif"
+TIME_STEP    = 100 * u.femtosecond
+INIT_CIF     = "init_struct.cif"
 
-# ────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ────────────────────────────────────────────────────────────────────────
-
-def _prepare_initial_structure(n_beads: int = N_BEADS) -> PDBxFile:  # type: ignore[name‑defined]
-    """Write (if necessary) and cache a straight chain as mmCIF, return PDBxFile."""
+# ─────────────────────────────────────────────────────────────
+#  przygotowanie struktury startowej
+# ─────────────────────────────────────────────────────────────
+def _prepare_initial_structure(n_beads: int = N_BEADS) -> PDBxFile:  # type: ignore[name-defined]
+    """Zapisuje (jednorazowo) prosty łańcuch jako mmCIF i zwraca PDBxFile."""
     if not os.path.exists(INIT_CIF):
-        pts = line(n_beads)                      # (nm) coordinates along x axis
-        write_mmcif(pts, INIT_CIF)
-        generate_psf(n_beads, "LE_init_struct.psf")  # purely for viz; not needed by OpenMM
+        coords = line(n_beads)                # prosta linia po osi x
+        write_mmcif(coords, INIT_CIF)
+        generate_psf(n_beads, "LE_init_struct.psf")  # opcjonalne – tylko do VMD
     return PDBxFile(INIT_CIF)
 
-
+# ─────────────────────────────────────────────────────────────
+#  budowa systemu z podanym wektorem ładunków
+# ─────────────────────────────────────────────────────────────
 def _build_system(charges: np.ndarray, kc: float):
-    """Create OpenMM System, Integrator and return also Coulomb force handle."""
     pdb = _prepare_initial_structure()
 
-    # classic excluded‑volume from earlier XML; no electrostatics there
+    # excluded-volume z pliku XML (bez elektrostatyki)
     ff = ForceField("forcefields/classic_sm_ff.xml")
     system = ff.createSystem(pdb.topology, nonbondedMethod=mm.app.NoCutoff)
 
-    # 1. Harmonic bonds (successive + loop)
-    bond_force = mm.HarmonicBondForce()
-    system.addForce(bond_force)
+    # 1) Harmonijne wiązania
+    bond = mm.HarmonicBondForce();  system.addForce(bond)
     for i in range(N_BEADS - 1):
-        bond_force.addBond(
-            i,
-            i + 1,
-            0.1 * u.nanometer,
-            300_000.0 * u.kilojoule_per_mole / u.nanometer**2,
-        )
-    bond_force.addBond(10, 70, 0.1 * u.nanometer, 300_000.0 * u.kilojoule_per_mole / u.nanometer**2)
+        bond.addBond(i, i + 1, 0.1 * u.nanometer,
+                     300_000.0 * u.kilojoule_per_mole / u.nanometer**2)
+    bond.addBond(10, 70, 0.1 * u.nanometer,
+                 300_000.0 * u.kilojoule_per_mole / u.nanometer**2)
 
-    # 2. Bending rigidity via harmonic angle
-    angle_force = mm.HarmonicAngleForce()
-    system.addForce(angle_force)
+    # 2) Sztywność kątowa
+    angle = mm.HarmonicAngleForce();  system.addForce(angle)
     for i in range(N_BEADS - 2):
-        angle_force.addAngle(
-            i,
-            i + 1,
-            i + 2,
-            np.pi * u.radian,
-            500 * u.kilojoule_per_mole / u.radian**2,
-        )
+        angle.addAngle(i, i + 1, i + 2,
+                       np.pi * u.radian,
+                       500 * u.kilojoule_per_mole / u.radian**2)
 
-    # 3. User‑defined Coulomb term (signed kc)
-       # --- tworzenie siły Coulomba ---
+    # 3) Coulomb  kc * q1 * q2 / r
     coulomb = mm.CustomNonbondedForce("kc*q1*q2/r")
-    coulomb.addPerParticleParameter("q")     # jeden parametr na cząstkę
+    coulomb.addPerParticleParameter("q")     # nazwa parametru
     coulomb.addGlobalParameter("kc", kc)
-    # wykluczamy pary 1-2 (bondy)
     coulomb.setNonbondedMethod(mm.CustomNonbondedForce.CutoffNonPeriodic)
-    coulomb.setCutoffDistance(1.0*u.nanometer)
+    coulomb.setCutoffDistance(1.0 * u.nanometer)
     system.addForce(coulomb)
-    
-    # --- pierwsze ustawienie ładunków ---
-    for i, q in enumerate(initial_charges):
+
+    #  inicjalizacja parametrów cząstek
+    for q in charges:
         coulomb.addParticle([float(q)])
 
-
-    # Langevin integrator
-    integrator = mm.LangevinIntegrator(DEFAULT_TEMP, 0.05 / u.picosecond, TIME_STEP)
-
+    integrator = mm.LangevinIntegrator(
+        DEFAULT_TEMP, 0.05 / u.picosecond, TIME_STEP
+    )
     return system, integrator, pdb, coulomb
 
-
-# ────────────────────────────────────────────────────────────────────────
-# Public API
-# ────────────────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────
+#  główna funkcja – MD + opcjonalny Ising
+# ─────────────────────────────────────────────────────────────
 def run_simulation(
-    charges: np.ndarray | list,
-    kc: float = 1.0,
-    *,
-    n_blocks: int = 1000,
-    steps_per_block: int = 1000,
-    dynamic: bool = False,
-    seed: int | None = 1234,
-    out_prefix: str = "run",
+    charges, *, kc=1.0,
+    n_blocks=1000, steps_per_block=1000,
+    dynamic=False, seed: int|None=1234,
+    out_prefix="run"
 ):
-    """Run coarse‑grained polymer MD with user‑supplied charges / spins.
-
-    Parameters
-    ----------
-    charges
-        1‑D iterable of length *N_BEADS* (100 by default).  Values are used
-        verbatim as `qi` in the potential.  When `dynamic=True`, the vector must
-        consist solely of ±1 and is treated as an *initial* Ising configuration
-        that evolves during the simulation.
-    kc
-        Prefactor in energy units kJ·nm/mol.  Positive → like‑sign attraction
-        (opposite of electrostatics); negative → conventional electrostatics.
-    n_blocks, steps_per_block
-        Simulation length = ``n_blocks * steps_per_block`` MD steps.
-    dynamic
-        If *True* perform a single‑spin Metropolis sweep (1‑D nearest‑neighbour
-        Ising, J=1, k_B T = 1) after every block and update charges in situ.
-        If *False* the supplied `charges` remain fixed.
-    seed
-        RNG seed used only for the internal Ising updates when `dynamic=True`.
-    out_prefix
-        Basename for output files: ``{out_prefix}.dcd`` (trajectory),
-        ``{out_prefix}.h5`` (mdtraj‑HDF5), ``{out_prefix}.npz`` (end‑to‑end data).
-
-    Returns
-    -------
-    dict
-        Keys: ``end2end`` (np.ndarray [n_blocks]), ``trajectory`` (str path).
-    """
-
+    """MD z opcjonalną ewolucją ładunków metodą Isinga."""
     charges = np.asarray(charges, dtype=float)
     if charges.shape != (N_BEADS,):
-        raise ValueError(f"charges must be length {N_BEADS}, got shape {charges.shape}")
-
+        raise ValueError(f"charges must be length {N_BEADS}, got {charges.shape}")
     if dynamic and not np.all(np.isin(charges, [-1, 1])):
-        raise ValueError("When dynamic=True, initial charges must be ±1 spins.")
+        raise ValueError("dynamic=True wymaga spinów ±1")
 
     system, integrator, pdb, coulomb = _build_system(charges, kc)
+    sim = Simulation(pdb.topology, system, integrator)
+    sim.context.setPositions(pdb.positions)
+    sim.minimizeEnergy(tolerance=1e-3)
 
-    simulation = Simulation(pdb.topology, system, integrator)
-    simulation.context.setPositions(pdb.positions)
-    simulation.minimizeEnergy(tolerance=1e-3)
+    sim.reporters += [
+        StateDataReporter(stdout, steps_per_block, step=True,
+                          potentialEnergy=True, temperature=True),
+        DCDReporter(f"{out_prefix}.dcd", steps_per_block),
+        HDF5Reporter(f"{out_prefix}.h5", steps_per_block,
+                     positions=True, time=True)
+    ]
 
-    # reporters
-    simulation.reporters.append(StateDataReporter(stdout, steps_per_block, step=True, potentialEnergy=True, temperature=True))
-    simulation.reporters.append(DCDReporter(f"{out_prefix}.dcd", steps_per_block))
-    simulation.reporters.append(HDF5Reporter(f"{out_prefix}.h5", steps_per_block, positions=True, time=True))
-
-    # storage arrays
-    end2end: list[float] = []
-
-    # Ising apparatus (only if dynamic=True)
+    spins = charges.astype(int).copy()
     rng = np.random.default_rng(seed)
-    spins = charges.astype(int).copy()  # copied even if dynamic=False for uniformity
-
-    def metropolis_single_flip() -> None:
+    def metropolis_flip():
         i = rng.integers(0, N_BEADS)
-        left, right = (i - 1) % N_BEADS, (i + 1) % N_BEADS
-        delta_E = 2 * spins[i] * (spins[left] + spins[right])  # J = 1, k_B T = 1
-        if delta_E <= 0 or rng.random() < np.exp(-delta_E):
+        dE = 2 * spins[i] * (spins[(i-1)%N_BEADS] + spins[(i+1)%N_BEADS])
+        if dE <= 0 or rng.random() < np.exp(-dE):
             spins[i] *= -1
 
-    # ───────── main loop ─────────
+    end2end = []
     for _ in tqdm(range(n_blocks), unit="blk", desc="Blocks"):
-        simulation.step(steps_per_block)
-        state = simulation.context.getState(getPositions=True)
-        pos = state.getPositions(asNumpy=True).value_in_unit(u.nanometer)
+        sim.step(steps_per_block)
+        pos = sim.context.getState(getPositions=True)\
+                  .getPositions(asNumpy=True).value_in_unit(u.nanometer)
         end2end.append(float(np.linalg.norm(pos[-1] - pos[0])))
 
         if dynamic:
-            # perform ~one full sweep
-            for _ in range(N_BEADS):
-                metropolis_single_flip()
-            # update charges in force & context
-            for idx, s in enumerate(spins):
-                coulomb.setParticleParameters(idx, [float(s)])
-            coulomb.updateParametersInContext(simulation.context)
+            for _ in range(N_BEADS):  metropolis_flip()
+            for i, s in enumerate(spins):
+                coulomb.setParticleParameters(i, [float(s)])
+            coulomb.updateParametersInContext(sim.context)
 
-    # ───────── save observables ─────────
     np.savez(f"{out_prefix}.npz", end2end=np.asarray(end2end))
-
-    return {"end2end": np.asarray(end2end), "trajectory": f"{out_prefix}.dcd"}
-
-
-# ────────────────── quick CLI test ──────────────────
-if __name__ == "__main__":
-    # fixed positive charges as sanity‑check, tiny run
-    run_simulation(np.ones(N_BEADS), kc=1.0, n_blocks=10, steps_per_block=1000, dynamic=False, out_prefix="test")
+    return {"end2end": np.asarray(end2end),
+            "trajectory": f"{out_prefix}.dcd"}
 
 # ─────────────────────────────────────────────────────────────
-# External spin trajectory → OpenMM
-#   spin_seq.shape == (n_frames, N_BEADS)
-#   Każda klatka trafia do Coulomba po jednym bloku MD.
+#  alternatywa: gotowa trajektoria spinów
 # ─────────────────────────────────────────────────────────────
 def run_simulation_with_spin_sequence(
-    spin_seq: np.ndarray,
-    kc: float = 1.0,
-    *,
-    steps_per_frame: int = 1000,
-    out_prefix: str = "ising_ext",
+    spin_seq: np.ndarray, *, kc=1.0,
+    steps_per_frame=1000, out_prefix="ising_ext"
 ):
     spin_seq = np.asarray(spin_seq, dtype=float)
-    n_frames, n_beads = spin_seq.shape
-    if n_beads != N_BEADS:
-        raise ValueError(f"spin_seq columns ({n_beads}) ≠ N_BEADS ({N_BEADS})")
+    n_frames, n_cols = spin_seq.shape
+    if n_cols != N_BEADS:
+        raise ValueError(f"spin_seq columns {n_cols} != N_BEADS {N_BEADS}")
 
     system, integrator, pdb, coulomb = _build_system(spin_seq[0], kc)
     sim = Simulation(pdb.topology, system, integrator)
     sim.context.setPositions(pdb.positions)
     sim.minimizeEnergy(tolerance=1e-3)
 
-    sim.reporters.append(DCDReporter(f"{out_prefix}.dcd", steps_per_frame))
-    sim.reporters.append(HDF5Reporter(f"{out_prefix}.h5", steps_per_frame, positions=True))
+    sim.reporters += [
+        DCDReporter(f"{out_prefix}.dcd", steps_per_frame),
+        HDF5Reporter(f"{out_prefix}.h5", steps_per_frame, positions=True)
+    ]
 
     end2end = []
-
-    for frame_idx in range(n_frames):
-        if frame_idx:                # od 2-giej klatki aktualizujemy ładunki
-            for i, q in enumerate(spin_seq[frame_idx]):
+    for frame in range(n_frames):
+        if frame:                       # od drugiej klatki aktualizujemy q
+            for i, q in enumerate(spin_seq[frame]):
                 coulomb.setParticleParameters(i, [float(q)])
             coulomb.updateParametersInContext(sim.context)
 
         sim.step(steps_per_frame)
-
-        state = sim.context.getState(getPositions=True)
-        pos = state.getPositions(asNumpy=True).value_in_unit(u.nanometer)
+        pos = sim.context.getState(getPositions=True)\
+                  .getPositions(asNumpy=True).value_in_unit(u.nanometer)
         end2end.append(float(np.linalg.norm(pos[-1] - pos[0])))
 
     np.savez(f"{out_prefix}.npz", end2end=np.asarray(end2end))
-    return {"end2end": np.asarray(end2end), "trajectory": f"{out_prefix}.dcd"}
+    return {"end2end": np.asarray(end2end),
+            "trajectory": f"{out_prefix}.dcd"}
 
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":        # szybki sanity-check
+    run_simulation(np.ones(N_BEADS),
+                   kc=1.0, n_blocks=5, steps_per_block=500,
+                   dynamic=False, out_prefix="test")
