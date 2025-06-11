@@ -233,3 +233,46 @@ def run_simulation(
 if __name__ == "__main__":
     # fixed positive charges as sanity‑check, tiny run
     run_simulation(np.ones(N_BEADS), kc=1.0, n_blocks=10, steps_per_block=1000, dynamic=False, out_prefix="test")
+
+# ─────────────────────────────────────────────────────────────
+# External spin trajectory → OpenMM
+#   spin_seq.shape == (n_frames, N_BEADS)
+#   Każda klatka trafia do Coulomba po jednym bloku MD.
+# ─────────────────────────────────────────────────────────────
+def run_simulation_with_spin_sequence(
+    spin_seq: np.ndarray,
+    kc: float = 1.0,
+    *,
+    steps_per_frame: int = 1000,
+    out_prefix: str = "ising_ext",
+):
+    spin_seq = np.asarray(spin_seq, dtype=float)
+    n_frames, n_beads = spin_seq.shape
+    if n_beads != N_BEADS:
+        raise ValueError(f"spin_seq columns ({n_beads}) ≠ N_BEADS ({N_BEADS})")
+
+    system, integrator, pdb, coulomb = _build_system(spin_seq[0], kc)
+    sim = Simulation(pdb.topology, system, integrator)
+    sim.context.setPositions(pdb.positions)
+    sim.minimizeEnergy(tolerance=1e-3)
+
+    sim.reporters.append(DCDReporter(f"{out_prefix}.dcd", steps_per_frame))
+    sim.reporters.append(HDF5Reporter(f"{out_prefix}.h5", steps_per_frame, positions=True))
+
+    end2end = []
+
+    for frame_idx in range(n_frames):
+        if frame_idx:                # od 2-giej klatki aktualizujemy ładunki
+            for i, q in enumerate(spin_seq[frame_idx]):
+                coulomb.setParticleParameters(i, [float(q)])
+            coulomb.updateParametersInContext(sim.context)
+
+        sim.step(steps_per_frame)
+
+        state = sim.context.getState(getPositions=True)
+        pos = state.getPositions(asNumpy=True).value_in_unit(u.nanometer)
+        end2end.append(float(np.linalg.norm(pos[-1] - pos[0])))
+
+    np.savez(f"{out_prefix}.npz", end2end=np.asarray(end2end))
+    return {"end2end": np.asarray(end2end), "trajectory": f"{out_prefix}.dcd"}
+
