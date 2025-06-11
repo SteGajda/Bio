@@ -111,19 +111,19 @@ def _build_system(charges: np.ndarray, kc: float):
         )
 
     # 3. User‑defined Coulomb term (signed kc)
-    coulomb = mm.CustomNonbondedForce("kc*qi*qj/r")
-    coulomb.addGlobalParameter("kc", kc * u.kilojoule_per_mole * u.nanometer)
-    coulomb.addPerParticleParameter("qi")
-
-    # exclude bonds (1‑2)
-    for i in range(N_BEADS - 1):
-        coulomb.addExclusion(i, i + 1)
-    coulomb.setNonbondedMethod(mm.CustomNonbondedForce.NoCutoff)
+       # --- tworzenie siły Coulomba ---
+    coulomb = mm.CustomNonbondedForce("kc*q1*q2/r")
+    coulomb.addPerParticleParameter("q")     # jeden parametr na cząstkę
+    coulomb.addGlobalParameter("kc", kc)
+    # wykluczamy pary 1-2 (bondy)
+    coulomb.setNonbondedMethod(mm.CustomNonbondedForce.CutoffNonPeriodic)
+    coulomb.setCutoffDistance(1.0*u.nanometer)
     system.addForce(coulomb)
-
-    # assign per‑particle charges
-    for q in charges:
+    
+    # --- pierwsze ustawienie ładunków ---
+    for i, q in enumerate(initial_charges):
         coulomb.addParticle([float(q)])
+
 
     # Langevin integrator
     integrator = mm.LangevinIntegrator(DEFAULT_TEMP, 0.05 / u.picosecond, TIME_STEP)
